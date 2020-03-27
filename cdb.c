@@ -13,8 +13,6 @@
 
 #include <capstone/capstone.h>
 
-#define CODE "\x55\x48\x8b\x05\xb8\x13\x00\x00"
-
 //Breakpoint struct for storing breakpoint metadata
 struct breakpoint {
 	void *address;
@@ -22,6 +20,7 @@ struct breakpoint {
 };
 
 //Global list of breakpoints
+//Currently, only one breakpoint is supported
 struct breakpoint breakpoints[1]; 
 
 //Return the instruction pointer (rip) of the tracee
@@ -32,18 +31,18 @@ uint64_t get_rip(pid_t child)
 	return regs.rip; 
 }
 
-void tracee() {
+void tracee(char *binary_path) {
 	//Inform the kernel that this process is to be debugged by parent process
 	//The tracee will stop each time a signal is delivered to the process
 	ptrace(PTRACE_TRACEME, 0, NULL, NULL);
 
-	char *argv[] = { "/home/jpatten/checkouts/cdb/hello", NULL};
+	char *argv[] = { binary_path, NULL};
 	char *envp[] = { NULL };
 
 	//Launch /bin/ls. Calls to execve in the tracee will cause it to be sent
 	//a SIGTRAP signal. This gives the parent a chance to gain control before
 	//the new program begins.
-	if(execve("/home/jpatten/checkouts/cdb/hello", argv, envp)) {
+	if(execve(binary_path, argv, envp)) {
 		printf("Error execve\n");
 	}
 }
@@ -59,11 +58,8 @@ void continue_execution(pid_t pid) {
     ptrace(PTRACE_GETSIGINFO, pid, NULL, &info);
 
 	if(WSTOPSIG(status) == SIGTRAP) {
-		printf("SIGTRAP\n");
-		printf("%d\n", info.si_code);
-		if(info.si_code == 128) {
-			printf("Breakpoint triggered\n");
-
+		if(breakpoints[0].address == (void*)(get_rip(pid) - 1)) {
+			printf("Breakpoint triggered at %p\n", (void*)breakpoints[0].address);
 			//Restore the original instruction and decrement the PC by one
 			ptrace(PTRACE_POKEDATA, pid, breakpoints[0].address, breakpoints[0].saved_instruction);
 			uint64_t rip = get_rip(pid);
@@ -72,31 +68,32 @@ void continue_execution(pid_t pid) {
 			ptrace(PTRACE_GETREGS, pid, NULL, &regs);
 			regs.rip = rip;
 			ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-		}	
-
+			breakpoints[0].address = NULL;
+		}
+		else {
+			printf("Tracer received unknown SIGTRAP\n");
+		}
 	}
 	
 	if(WIFEXITED(status)) {
-		printf("Child exited normally\n");
+		printf("Child exited normaly\n");
 	}	
 }
 
 void tracer(pid_t child) {
-	printf("Debugging PID %d\n", child);
 	pid_t c;
 	int status;
 	char command;
 
 	c = waitpid(child, &status, 0);
 	if(WIFEXITED(status)) {
-		printf("Child exited normally\n");
+		printf("Child exited normaly\n");
 	}	
 
 	while(1) {
 		printf("cdb>");
 		command = getchar();
 		getchar();
-		printf("command: %c\n", command);
 		if(command == 'c') {
 			continue_execution(child);	
 		} 
@@ -192,32 +189,39 @@ void tracer(pid_t child) {
 				printf("Breakpoint address: %p\n", breakpoints[0].address);	
 			}
 			else if(option == 's') {
-				char addr[20];
-				memset(addr, 0, 9);
-				uint64_t return_data;
-				struct breakpoint br;
-				scanf("%s", addr);
-				getchar();
-				uint64_t addr_hex = strtol(addr, NULL, 16);
-				
-				br.address = (void*)addr_hex;
-				return_data = ptrace(PTRACE_PEEKDATA, child, br.address, NULL);
+				if(breakpoints[0].address == NULL) {
+					char addr[20];
+					memset(addr, 0, 9);
+					uint64_t return_data;
+					struct breakpoint br;
+					scanf("%s", addr);
+					getchar();
+					uint64_t addr_hex = strtol(addr, NULL, 16);
+					
+					br.address = (void*)addr_hex;
+					return_data = ptrace(PTRACE_PEEKDATA, child, br.address, NULL);
 
-				br.saved_instruction = return_data;
-				breakpoints[0] = br;
+					br.saved_instruction = return_data;
+					breakpoints[0] = br;
 
-				//Overwrite the first byte of the instruction at breakpoint address
-				//with the INT 3 instruction. Upon execution in the tracee, an interrupt 
-				//will be triggered - the handler (registered by the OS) sends a SIGSTOP to 
-				//the tracee and a SIGTRAP to the tracer.
-				uint64_t int3 = 0xcc;
-				uint64_t breakpoint = (return_data & ~0xff) | int3;
+					//Overwrite the first byte of the instruction at breakpoint address
+					//with the INT 3 instruction. Upon execution in the tracee, an interrupt 
+					//will be triggered - the handler (registered by the OS) sends a SIGSTOP to 
+					//the tracee and a SIGTRAP to the tracer.
+					uint64_t int3 = 0xcc;
+					uint64_t breakpoint = (return_data & ~0xff) | int3;
 
-				ptrace(PTRACE_POKEDATA, child, br.address, breakpoint);
-				return_data = ptrace(PTRACE_PEEKDATA, child, br.address, NULL);
+					ptrace(PTRACE_POKEDATA, child, br.address, breakpoint);
+					return_data = ptrace(PTRACE_PEEKDATA, child, br.address, NULL);
+				}
+				else {
+					printf("Breakpoint already exists\n");
+				}
 			}
 			else if(option == 'c') {
-				
+				ptrace(PTRACE_POKEDATA, child, breakpoints[0].address, breakpoints[0].saved_instruction);
+				breakpoints[0].address = NULL;
+				printf("Breakpoint deleted\n");
 			}
 			else {
 				printf("Unknown option\n");
@@ -231,16 +235,22 @@ void tracer(pid_t child) {
 	}
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+	if(argc != 2) {
+		printf("Usage: cdb <binary>\n");
+		return 0;
+	}
+	if(access(argv[1], F_OK)){
+		printf("%s does not exist\n", argv[1]);
+		return 0;
+	}
+
 	printf("Welcome to cdb\n");
-
-	uint64_t return_data = 0xffeeddccbbaa9988;
-
 	pid_t child;
 	child = fork();
 
 	if(child == 0) {
-		tracee();
+		tracee(argv[1]);
 	} else {
 		tracer(child);
 	}
